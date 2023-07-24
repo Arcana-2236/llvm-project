@@ -11,6 +11,8 @@
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -157,6 +159,13 @@ struct CppEmitter {
   /// be declared at the beginning of a function.
   bool shouldDeclareVariablesAtTop() { return declareVariablesAtTop; };
 
+  // create cuda built-in variable
+  LogicalResult CreateCudaBuiltinVar(Value val, std::string builtin_name);
+  // emit pointer type memref
+  LogicalResult emitMemref(Value memref, Value indice);
+  // decide whether builtin vars
+  bool IscudaBuiltin(Operation &op);
+
 private:
   using ValueMapper = llvm::ScopedHashTable<Value, std::string>;
   using BlockMapper = llvm::ScopedHashTable<Block *, std::string>;
@@ -234,6 +243,7 @@ static LogicalResult printOperation(CppEmitter &emitter,
                                     arith::ConstantOp constantOp) {
   Operation *operation = constantOp.getOperation();
   Attribute value = constantOp.getValue();
+  raw_ostream &os = emitter.ostream();
 
   return printConstantOp(emitter, operation, value);
 }
@@ -670,7 +680,7 @@ static LogicalResult printOperation(CppEmitter &emitter,
       // When generating code for an scf.for op, printing a trailing semicolon
       // is handled within the printOperation function.
       bool trailingSemicolon =
-          !isa<scf::IfOp, scf::ForOp, cf::CondBranchOp>(op);
+          !isa<scf::IfOp, scf::ForOp, cf::CondBranchOp, gpu::BlockIdOp, gpu::BlockDimOp, gpu::ThreadIdOp, gpu::GridDimOp>(op);
 
       if (failed(emitter.emitOperation(
               op, /*trailingSemicolon=*/trailingSemicolon)))
@@ -678,6 +688,332 @@ static LogicalResult printOperation(CppEmitter &emitter,
     }
   }
   os.unindent() << "}\n";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::GPUModuleOp GPUModuleOp) {
+  CppEmitter::Scope scope(emitter);
+
+  for (Operation &op : GPUModuleOp) {
+    if (failed(emitter.emitOperation(op, /*trailingSemicolon=*/false)))
+      return failure();
+  }
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::GPUFuncOp GPUFuncOp) {
+  // We need to declare variables at top if the function has multiple blocks.
+  if (!emitter.shouldDeclareVariablesAtTop() &&
+      GPUFuncOp.getBlocks().size() > 1) {
+    return GPUFuncOp.emitOpError(
+        "with multiple blocks needs variables declared at top");
+  }
+
+  CppEmitter::Scope scope(emitter);
+  raw_indented_ostream &os = emitter.ostream();
+  if (failed(emitter.emitTypes(GPUFuncOp.getLoc(),
+                               GPUFuncOp.getFunctionType().getResults())))
+    return failure();
+  os << " __global__ " << GPUFuncOp.getName();
+
+  os << "(";
+  if (failed(interleaveCommaWithError(
+          GPUFuncOp.getArguments(), os,
+          [&](BlockArgument arg) -> LogicalResult {
+            if (failed(emitter.emitType(GPUFuncOp.getLoc(), arg.getType())))
+              return failure();
+            os << " " << emitter.getOrCreateName(arg);
+            return success();
+          })))
+    return failure();
+  os << ") {\n";
+  os.indent();
+  if (emitter.shouldDeclareVariablesAtTop()) {
+    // Declare all variables that hold op results including those from nested
+    // regions.
+    WalkResult result =
+        GPUFuncOp.walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+          if (!emitter.IscudaBuiltin(*op)) {
+            for (OpResult result : op->getResults()) {
+              if (failed(emitter.emitVariableDeclaration(
+                    result, /*trailingSemicolon=*/true))) {
+                return WalkResult(
+                  op->emitError("unable to declare result variable for op"));
+              }
+            }
+          }
+          return WalkResult::advance();
+        });
+    if (result.wasInterrupted())
+      return failure();
+  }
+
+  Region::BlockListType &blocks = GPUFuncOp.getBlocks();
+  // Create label names for basic blocks.
+  for (Block &block : blocks) {
+    emitter.getOrCreateName(block);
+  }
+
+  // Declare variables for basic block arguments.
+  for (Block &block : llvm::drop_begin(blocks)) {
+    for (BlockArgument &arg : block.getArguments()) {
+      if (emitter.hasValueInScope(arg))
+        return GPUFuncOp.emitOpError(" block argument #")
+               << arg.getArgNumber() << " is out of scope";
+      if (failed(
+              emitter.emitType(block.getParentOp()->getLoc(), arg.getType()))) {
+        return failure();
+      }
+      os << " " << emitter.getOrCreateName(arg) << ";\n";
+    }
+  }
+
+  for (Block &block : blocks) {
+    // Only print a label if the block has predecessors.
+    if (!block.hasNoPredecessors()) {
+      if (failed(emitter.emitLabel(block)))
+        return failure();
+    }
+    for (Operation &op : block.getOperations()) {
+      // When generating code for an scf.if or cf.cond_br op no semicolon needs
+      // to be printed after the closing brace.
+      // When generating code for an scf.for op, printing a trailing semicolon
+      // is handled within the printOperation function.
+      bool trailingSemicolon =
+          !isa<scf::IfOp, scf::ForOp, cf::CondBranchOp, gpu::BlockIdOp, gpu::BlockDimOp, gpu::ThreadIdOp, gpu::GridDimOp>(op);
+
+      if (failed(emitter.emitOperation(
+              op, /*trailingSemicolon=*/trailingSemicolon)))
+        return failure();
+    }
+  }
+  os.unindent() << "}\n";
+  return success();
+}
+
+bool CppEmitter::IscudaBuiltin(Operation &op) {
+  if (dyn_cast<gpu::BlockIdOp>(op) || dyn_cast<gpu::BlockDimOp>(op) || dyn_cast<gpu::ThreadIdOp>(op) || dyn_cast<gpu::GridDimOp>(op))
+    return true;
+  return false;
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::LaunchOp launchOp) {
+  raw_ostream &os = emitter.ostream();
+
+  os << "can print launch";
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::ReturnOp returnOp) {
+  raw_ostream &os = emitter.ostream();
+  os << "return";
+  switch (returnOp.getNumOperands()) {
+  case 0:
+    return success();
+  case 1:
+    os << " " << emitter.getOrCreateName(returnOp.getOperand(0));
+    return success(emitter.hasValueInScope(returnOp.getOperand(0)));
+  default:
+    os << " std::make_tuple(";
+    if (failed(emitter.emitOperandsAndAttributes(*returnOp.getOperation())))
+      return failure();
+    os << ")";
+    return success();
+  }
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::ModuleEndOp ModuleEndOp) {
+  // BlockIdx is built-in variable, so no need to declare or print, just need to record the val
+  raw_ostream &os = emitter.ostream();
+
+  os << "pseudo op that marks the end of a gpu.module";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::BlockIdOp BlockIdOp) {
+  // BlockIdx is built-in variable, so no need to declare or print, just need to record the val
+  raw_ostream &os = emitter.ostream();
+
+  OpResult result = BlockIdOp.getOperation()->getResult(0);
+  gpu::Dimension dim = BlockIdOp.getDimension();
+  std::string builtin_name = "blockIdx.";
+
+  switch(dim){
+    case gpu::Dimension(0):
+      builtin_name += "x";
+      break;
+    case gpu::Dimension(1):
+      builtin_name += "y";
+      break;
+    case gpu::Dimension(2):
+      builtin_name += "z";
+      break;
+    default:
+      llvm::errs() << "irregular dimension\n";
+  } 
+  emitter.CreateCudaBuiltinVar(result, builtin_name);
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::BlockDimOp BlockDimOp) {
+  // BlockIdx is built-in variable, so no need to declare or print, just need to record the val
+  raw_ostream &os = emitter.ostream();
+
+  OpResult result = BlockDimOp.getOperation()->getResult(0);
+  gpu::Dimension dim = BlockDimOp.getDimension();
+  std::string builtin_name = "blockDim.";
+
+  switch(dim){
+    case gpu::Dimension(0):
+      builtin_name += "x";
+      break;
+    case gpu::Dimension(1):
+      builtin_name += "y";
+      break;
+    case gpu::Dimension(2):
+      builtin_name += "z";
+      break;
+    default:
+      llvm::errs() << "irregular dimension\n";
+  } 
+  emitter.CreateCudaBuiltinVar(result, builtin_name);
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::ThreadIdOp ThreadIdOp) {
+  // BlockIdx is built-in variable, so no need to declare or print, just need to record the val
+  raw_ostream &os = emitter.ostream();
+
+  OpResult result = ThreadIdOp.getOperation()->getResult(0);
+  gpu::Dimension dim = ThreadIdOp.getDimension();
+  std::string builtin_name = "threadIdx.";
+
+  switch(dim){
+    case gpu::Dimension(0):
+      builtin_name += "x";
+      break;
+    case gpu::Dimension(1):
+      builtin_name += "y";
+      break;
+    case gpu::Dimension(2):
+      builtin_name += "z";
+      break;
+    default:
+      llvm::errs() << "irregular dimension\n";
+  } 
+  emitter.CreateCudaBuiltinVar(result, builtin_name);
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    gpu::GridDimOp GridDimOp) {
+  // BlockIdx is built-in variable, so no need to declare or print, just need to record the val
+  raw_ostream &os = emitter.ostream();
+
+  OpResult result = GridDimOp.getOperation()->getResult(0);
+  gpu::Dimension dim = GridDimOp.getDimension();
+  std::string builtin_name = "gridDim.";
+
+  switch(dim){
+    case gpu::Dimension(0):
+      builtin_name += "x";
+      break;
+    case gpu::Dimension(1):
+      builtin_name += "y";
+      break;
+    case gpu::Dimension(2):
+      builtin_name += "z";
+      break;
+    default:
+      llvm::errs() << "irregular dimension\n";
+  } 
+  emitter.CreateCudaBuiltinVar(result, builtin_name);
+
+  return success();
+}
+
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    memref::LoadOp loadOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *loadOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+  
+  return emitter.emitMemref(op.getOperands()[0], op.getOperands()[1]);
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    memref::StoreOp storeOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *storeOp.getOperation();
+
+  if (failed(emitter.emitMemref(op.getOperands()[1], op.getOperands()[2])))
+    return failure();
+  
+  os << " = ";
+
+  Value value = op.getOperands()[0];
+  if (!emitter.hasValueInScope(value)) {
+    llvm::errs() << "value operand value not in scope";
+    return failure();
+  }
+  os << emitter.getOrCreateName(value);
+  
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::AddFOp addfOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *addfOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+  
+  os << "add" << "(";
+
+  os << emitter.getOrCreateName(op.getOperands()[0]) << ", " << emitter.getOrCreateName(op.getOperands()[1]) << ")";
+  return success();
+}
+
+/// Emit memref in the pointer way
+LogicalResult CppEmitter::emitMemref(Value memref, Value indice) {
+  os << "*(";
+  if (!hasValueInScope(memref)) {
+    llvm::errs() << "memref operand value not in scope";
+    return failure();
+  }
+  os << getOrCreateName(memref);
+
+  os << " + ";
+
+  if (!hasValueInScope(indice)){
+    llvm::errs() << "indice operand value not in scope";
+    return failure();
+  }
+  os << getOrCreateName(indice);
+
+  os << ")";
+  return success();
+}
+
+/// create and register a new built-in variable.
+LogicalResult CppEmitter::CreateCudaBuiltinVar(Value val, std::string builtin_name) {
+  valueMapper.insert(val, builtin_name);
   return success();
 }
 
@@ -922,6 +1258,7 @@ LogicalResult CppEmitter::emitLabel(Block &block) {
 }
 
 LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
+  bool emitflag = true;
   LogicalResult status =
       llvm::TypeSwitch<Operation *, LogicalResult>(&op)
           // Builtin ops.
@@ -942,13 +1279,32 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
           // Arithmetic ops.
           .Case<arith::ConstantOp>(
               [&](auto op) { return printOperation(*this, op); })
+          // GPU ops.
+          .Case<gpu::GPUModuleOp, gpu::LaunchOp, gpu::GPUFuncOp, gpu::ReturnOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          // GPU ops, but no need to emit.
+          .Case<gpu::BlockIdOp, gpu::BlockDimOp, gpu::ThreadIdOp, gpu::GridDimOp, gpu::ModuleEndOp> (
+              [&](auto op) { 
+                emitflag = false;
+                return printOperation(*this, op); 
+              })
+          // Memref Ops
+          .Case<memref::LoadOp, memref::StoreOp> (
+              [&](auto op) { return printOperation(*this, op); })
+          // Arithmetic ops.
+          .Case<arith::AddFOp>(
+              [&](auto op) { return printOperation(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
           });
 
   if (failed(status))
     return failure();
-  os << (trailingSemicolon ? ";\n" : "\n");
+  if (trailingSemicolon)
+    os << ";";
+  if (emitflag)
+    os << "\n";
+  // os << (trailingSemicolon ? ";\n" : "\n");
   return success();
 }
 
@@ -1005,6 +1361,13 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   }
   if (auto pType = dyn_cast<emitc::PointerType>(type)) {
     if (failed(emitType(loc, pType.getPointee())))
+      return failure();
+    os << "*";
+    return success();
+  }
+  // Is this correct? This is for parameters in function definition
+  if (auto mType = dyn_cast<BaseMemRefType>(type)) {
+    if (failed(emitType(loc, mType.getElementType())))
       return failure();
     os << "*";
     return success();
