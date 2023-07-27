@@ -14,6 +14,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
@@ -50,7 +51,8 @@ void registerToCppTranslation() {
                         math::MathDialect,
                         scf::SCFDialect,
                         gpu::GPUDialect,
-                        memref::MemRefDialect>();
+                        memref::MemRefDialect,
+                        affine::AffineDialect>();
         // clang-format on
       });
 }

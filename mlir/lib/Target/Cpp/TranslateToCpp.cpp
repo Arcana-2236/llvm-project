@@ -13,6 +13,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -25,6 +27,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Value.h"
 #include <utility>
 
 #define DEBUG_TYPE "translate-to-cpp"
@@ -976,6 +980,7 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
+
 static LogicalResult printOperation(CppEmitter &emitter,
                                     arith::AddFOp addfOp) {
   raw_ostream &os = emitter.ostream();
@@ -987,6 +992,134 @@ static LogicalResult printOperation(CppEmitter &emitter,
   os << "add" << "(";
 
   os << emitter.getOrCreateName(op.getOperands()[0]) << ", " << emitter.getOrCreateName(op.getOperands()[1]) << ")";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::AddIOp addiOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *addiOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+  
+  os << "add" << "(";
+
+  os << emitter.getOrCreateName(op.getOperands()[0]) << ", " << emitter.getOrCreateName(op.getOperands()[1]) << ")";
+  return success();
+}
+
+std::string emitBinaryOperator(AffineExprKind kind) {
+  switch (kind) {
+    case AffineExprKind::Add:
+      return "+";
+    case AffineExprKind::Mul:
+      return "*";
+    case AffineExprKind::Mod:
+      return "%";
+    case AffineExprKind::FloorDiv:
+      return "/";
+    case AffineExprKind::CeilDiv:
+      return "/";
+    default:
+      llvm::errs() << "irregular binary operator\n";
+      return " ";
+  }
+}
+
+// 0 represent LHS, 1 represent RHS
+std::string emitExpression(CppEmitter &emitter, AffineExpr expr, AffineExprKind kind, mlir::OperandRange operands, unsigned numDims, bool LHSOrRHS) {
+  if (expr.getKind() == AffineExprKind::DimId || expr.getKind() == AffineExprKind::SymbolId || expr.getKind() == AffineExprKind::Constant) {
+    std::string result;
+    llvm::raw_string_ostream rso(result);
+    expr.print(rso);
+
+    if (expr.getKind() == AffineExprKind::Constant) {
+      if (result != "" && result[0] == '-')
+        return "(" + result + ")";
+      return result;
+    }
+
+    int index = std::stoi(result.substr(1));
+    if (result.find("d") != std::string::npos)
+      return emitter.getOrCreateName(operands[index]).str();
+    return emitter.getOrCreateName(operands[numDims + index]).str();
+  }
+  auto newExpr = expr.cast<AffineBinaryOpExpr>();
+
+  std::string left = "";
+  std::string right = "";
+
+  if (LHSOrRHS == 0) {
+    if (newExpr.getKind() == AffineExprKind::Add && kind != AffineExprKind::Add) {
+      left = "(";
+      right = ")";
+    }
+  } else {
+    if (newExpr.getKind() == AffineExprKind::Add || (newExpr.getKind() != AffineExprKind::Add && kind != AffineExprKind::Add)) {
+      left = "(";
+      right = ")";
+    }
+  }
+
+  if (newExpr.getKind() == AffineExprKind::CeilDiv) {
+    return left + "(" + 
+            emitExpression(emitter, newExpr.getLHS(), AffineExprKind::Add, operands, numDims, 0) + " + " + 
+            emitExpression(emitter, newExpr.getRHS(), AffineExprKind::Add, operands, numDims, 1) + " - 1) " + 
+            emitBinaryOperator(newExpr.getKind()) + " " +
+            emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), operands, numDims, 1) + right;
+  }
+
+  return left + emitExpression(emitter, newExpr.getLHS(), newExpr.getKind(), operands, numDims, 0) + " " +
+                emitBinaryOperator(newExpr.getKind()) + " " +
+                emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), operands, numDims, 1) + right;
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    affine::AffineApplyOp affineApplyOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *affineApplyOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+
+  for (auto expr : affineApplyOp.getMap().getResults()) {
+    if (expr.getKind() == AffineExprKind::SymbolId || expr.getKind() == AffineExprKind::DimId || expr.getKind() == AffineExprKind::Constant) {
+      std::string result;
+      llvm::raw_string_ostream rso(result);
+      expr.print(rso);
+
+      if (expr.getKind() == AffineExprKind::Constant) {
+        os << result;
+        return success();
+      }
+
+      int index = std::stoi(result.substr(1));
+      if (result.find("d") != std::string::npos)
+        os << emitter.getOrCreateName(op.getOperands()[index]);
+      else
+        os << emitter.getOrCreateName(op.getOperands()[affineApplyOp.getMap().getNumDims() + index]);
+
+      return success();
+    }
+
+    auto newExpr = expr.cast<AffineBinaryOpExpr>();
+    std::string result;
+    if (newExpr.getKind() == AffineExprKind::CeilDiv) {
+      result = "(" + 
+              emitExpression(emitter, newExpr.getLHS(), AffineExprKind::Add, op.getOperands(), affineApplyOp.getMap().getNumDims(), 0) + " + " + 
+              emitExpression(emitter, newExpr.getRHS(), AffineExprKind::Add, op.getOperands(), affineApplyOp.getMap().getNumDims(), 1) + " - 1) " + 
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineApplyOp.getMap().getNumDims(), 1);
+    } else {
+      result = emitExpression(emitter, newExpr.getLHS(), newExpr.getKind(), op.getOperands(), affineApplyOp.getMap().getNumDims(), 0) + " " +
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineApplyOp.getMap().getNumDims(), 1);
+    }
+
+    os << result;
+  }
+
   return success();
 }
 
@@ -1293,6 +1426,11 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
               [&](auto op) { return printOperation(*this, op); })
           // Arithmetic ops.
           .Case<arith::AddFOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          .Case<arith::AddIOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          // affine Ops
+          .Case<affine::AffineApplyOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
