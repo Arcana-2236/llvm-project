@@ -1123,6 +1123,138 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    affine::AffineMinOp affineMinOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *affineMinOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+
+  os << "min(";
+
+  unsigned cnt = 0;
+  for (auto expr : affineMinOp.getMap().getResults()) {
+    if (expr.getKind() == AffineExprKind::SymbolId || expr.getKind() == AffineExprKind::DimId || expr.getKind() == AffineExprKind::Constant) {
+      std::string result;
+      llvm::raw_string_ostream rso(result);
+      expr.print(rso);
+
+      if (expr.getKind() == AffineExprKind::Constant) {
+        if (cnt != affineMinOp.getMap().getNumResults() - 1) {
+          os << ", ";
+          cnt++;
+        }
+        os << result;
+        continue;
+      }
+
+      int index = std::stoi(result.substr(1));
+      if (result.find("d") != std::string::npos)
+        os << emitter.getOrCreateName(op.getOperands()[index]);
+      else
+        os << emitter.getOrCreateName(op.getOperands()[affineMinOp.getMap().getNumDims() + index]);
+
+      if (cnt != affineMinOp.getMap().getNumResults() - 1) {
+        os << ", ";
+        cnt++;
+      }
+
+      continue;
+    }
+
+    auto newExpr = expr.cast<AffineBinaryOpExpr>();
+    std::string result;
+    if (newExpr.getKind() == AffineExprKind::CeilDiv) {
+      result = "(" + 
+              emitExpression(emitter, newExpr.getLHS(), AffineExprKind::Add, op.getOperands(), affineMinOp.getMap().getNumDims(), 0) + " + " + 
+              emitExpression(emitter, newExpr.getRHS(), AffineExprKind::Add, op.getOperands(), affineMinOp.getMap().getNumDims(), 1) + " - 1) " + 
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineMinOp.getMap().getNumDims(), 1);
+    } else {
+      result = emitExpression(emitter, newExpr.getLHS(), newExpr.getKind(), op.getOperands(), affineMinOp.getMap().getNumDims(), 0) + " " +
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineMinOp.getMap().getNumDims(), 1);
+    }
+
+    if (cnt != affineMinOp.getMap().getNumResults() - 1) {
+      os << ", ";
+      cnt++;
+    }
+    os << result;
+  }
+
+  os<< ")";
+
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    affine::AffineMaxOp affineMaxOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *affineMaxOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+
+  os << "max(";
+
+  unsigned  cnt = 0;
+  for (auto expr : affineMaxOp.getMap().getResults()) {
+    if (expr.getKind() == AffineExprKind::SymbolId || expr.getKind() == AffineExprKind::DimId || expr.getKind() == AffineExprKind::Constant) {
+      std::string result;
+      llvm::raw_string_ostream rso(result);
+      expr.print(rso);
+
+      if (expr.getKind() == AffineExprKind::Constant) {
+        if (cnt != affineMaxOp.getMap().getNumResults() - 1) {
+          os << ", ";
+          cnt++;
+        }
+        os << result;
+        continue;
+      }
+
+      int index = std::stoi(result.substr(1));
+      if (result.find("d") != std::string::npos)
+        os << emitter.getOrCreateName(op.getOperands()[index]);
+      else
+        os << emitter.getOrCreateName(op.getOperands()[affineMaxOp.getMap().getNumDims() + index]);
+
+      if (cnt != affineMaxOp.getMap().getNumResults() - 1) {
+        os << ", ";
+        cnt++;
+      }
+
+      continue;
+    }
+
+    auto newExpr = expr.cast<AffineBinaryOpExpr>();
+    std::string result;
+    if (newExpr.getKind() == AffineExprKind::CeilDiv) {
+      result = "(" + 
+              emitExpression(emitter, newExpr.getLHS(), AffineExprKind::Add, op.getOperands(), affineMaxOp.getMap().getNumDims(), 0) + " + " + 
+              emitExpression(emitter, newExpr.getRHS(), AffineExprKind::Add, op.getOperands(), affineMaxOp.getMap().getNumDims(), 1) + " - 1) " + 
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineMaxOp.getMap().getNumDims(), 1);
+    } else {
+      result = emitExpression(emitter, newExpr.getLHS(), newExpr.getKind(), op.getOperands(), affineMaxOp.getMap().getNumDims(), 0) + " " +
+              emitBinaryOperator(newExpr.getKind()) + " " +
+              emitExpression(emitter, newExpr.getRHS(), newExpr.getKind(), op.getOperands(), affineMaxOp.getMap().getNumDims(), 1);
+    }
+
+    if (cnt != affineMaxOp.getMap().getNumResults() - 1) {
+      os << ", ";
+      cnt++;
+    }
+    os << result;
+  }
+
+  os<< ")";
+
+  return success();
+}
+
 /// Emit memref in the pointer way
 LogicalResult CppEmitter::emitMemref(Value memref, Value indice) {
   os << "*(";
@@ -1429,8 +1561,14 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
               [&](auto op) { return printOperation(*this, op); })
           .Case<arith::AddIOp>(
               [&](auto op) { return printOperation(*this, op); })
-          // affine Ops
+          // Affine Apply Ops
           .Case<affine::AffineApplyOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          // Affine Min Ops
+          .Case<affine::AffineMinOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          // Affine Max Ops
+          .Case<affine::AffineMaxOp>(
               [&](auto op) { return printOperation(*this, op); })
           .Default([&](Operation *) {
             return op.emitOpError("unable to find printer for op");
