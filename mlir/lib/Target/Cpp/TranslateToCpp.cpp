@@ -1009,6 +1009,34 @@ static LogicalResult printOperation(CppEmitter &emitter,
   return success();
 }
 
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::MulFOp mulfOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *mulfOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+  
+  os << "mul" << "(";
+
+  os << emitter.getOrCreateName(op.getOperands()[0]) << ", " << emitter.getOrCreateName(op.getOperands()[1]) << ")";
+  return success();
+}
+
+static LogicalResult printOperation(CppEmitter &emitter,
+                                    arith::TruncFOp truncfOp) {
+  raw_ostream &os = emitter.ostream();
+  Operation &op = *truncfOp.getOperation();
+
+  if (failed(emitter.emitAssignPrefix(op)))
+    return failure();
+
+  os << "truncf" << "(";
+
+  os << emitter.getOrCreateName(op.getOperands()[0]) << ")";
+  return success();
+}
+
 std::string emitBinaryOperator(AffineExprKind kind) {
   switch (kind) {
     case AffineExprKind::Add:
@@ -1561,6 +1589,10 @@ LogicalResult CppEmitter::emitOperation(Operation &op, bool trailingSemicolon) {
               [&](auto op) { return printOperation(*this, op); })
           .Case<arith::AddIOp>(
               [&](auto op) { return printOperation(*this, op); })
+          .Case<arith::MulFOp>(
+              [&](auto op) { return printOperation(*this, op); })
+          .Case<arith::TruncFOp>(
+              [&](auto op) { return printOperation(*this, op); })
           // Affine Apply Ops
           .Case<affine::AffineApplyOp>(
               [&](auto op) { return printOperation(*this, op); })
@@ -1603,6 +1635,8 @@ LogicalResult CppEmitter::emitType(Location loc, Type type) {
   }
   if (auto fType = dyn_cast<FloatType>(type)) {
     switch (fType.getWidth()) {
+    case 16:
+      return (os << "half"), success();
     case 32:
       return (os << "float"), success();
     case 64:
